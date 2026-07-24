@@ -14,10 +14,10 @@
  * static rung work against Alpine from a glibc host.
  *
  * Expected to be launched with:
- *     --userns=container:<task>   so we are in the user namespace that OWNS the
+ *     --userns=container:<target>   so we are in the user namespace that OWNS the
  *                                 target mount namespace (this is what makes
  *                                 setns permissible; no userns setns needed)
- *     --pid=container:<task>      so the target is visible as PID 1
+ *     --pid=container:<target>      so the target is visible as PID 1
  *                                 (or use --ns-file with a bind-mounted nsfs file)
  *     --cap-add=SYS_ADMIN         the default seccomp profile gates setns on it
  */

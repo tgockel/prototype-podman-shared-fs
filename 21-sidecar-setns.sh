@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Sidecar experiment 2 -- full fidelity: the sidecar joins the TASK container's
-# mount namespace, so it sees the task image's entire rootfs plus its volumes,
+# mount namespace, so it sees the target image's entire rootfs plus its volumes,
 # while its own image supplies the program and runtime.
 #
-#   ./21-sidecar-setns.sh [task-container]
+#   ./21-sidecar-setns.sh [target-container]
 #
 # Two variants are exercised, plus the negative tests that pin down which
 # capabilities are actually load-bearing.
@@ -37,9 +37,9 @@ note "the sidecar keeps its own PID namespace; only the mount namespace is joine
 podman run --rm \
     --userns="container:$ctr" \
     --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE \
-    -v "/proc/$cpid/ns:/task-ns:ro" \
+    -v "/proc/$cpid/ns:/target-ns:ro" \
     "${mounts[@]}" \
-    "$SIDECAR_IMAGE" /sidecar-enter --ns-file /task-ns/mnt -- /probe
+    "$SIDECAR_IMAGE" /sidecar-enter --ns-file /target-ns/mnt -- /probe
 
 hdr "negative tests -- which flags are actually required"
 
@@ -55,12 +55,12 @@ podman run --rm --pid="container:$ctr" --userns="container:$ctr" --cap-add=SYS_A
 
 printf '  binding the nsfs FILE (not dir): '
 podman run --rm --userns="container:$ctr" --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE \
-    -v "/proc/$cpid/ns/mnt:/task-mnt-ns:ro" "${mounts[@]}" \
-    "$SIDECAR_IMAGE" /sidecar-enter --ns-file /task-mnt-ns -- /probe 2>&1 \
+    -v "/proc/$cpid/ns/mnt:/target-mnt-ns:ro" "${mounts[@]}" \
+    "$SIDECAR_IMAGE" /sidecar-enter --ns-file /target-mnt-ns -- /probe 2>&1 \
     | grep -o 'invalid argument' | head -1 || echo "worked"
 echo "    ^ podman's -v always adds MS_REC, which nsfs rejects; bind the DIRECTORY"
 
-hdr "is the graft visible to the task container?"
+hdr "is the graft visible to the target container?"
 printf '  ls /mnt inside %s -> ' "$ctr"
 out=$(podman exec "$ctr" ls -A /mnt 2>&1)
 [ -z "$out" ] && echo "empty (private to the sidecar, as intended)" || echo "LEAKED: $out"

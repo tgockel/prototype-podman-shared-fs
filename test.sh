@@ -29,13 +29,13 @@ hdr "rung 2 -- static host binary, absent from the image"
 check "runs at all (debian)"       "./enterfs.py -c $DEMO_CTR -- ./probe | grep -q 'ID=debian'"
 check "runs on musl image"         "./enterfs.py -c $DEMO_CTR_MUSL -- ./probe | grep -q 'ID=alpine'"
 check "sees the image toolchain"   "./enterfs.py -c $DEMO_CTR -- ./probe | grep -q '/usr/local/cargo/bin/cargo *present'"
-check "host root NOT visible"      "./enterfs.py -c $DEMO_CTR -- ./probe | grep -q '/home/travis *ABSENT'"
+check "host root NOT visible"      "./enterfs.py -c $DEMO_CTR -- ./probe | grep -q 'host .HOME *ABSENT'"
 check "binary absent in container" "! ./01-enter.sh $DEMO_CTR -- test -e $HERE/probe"
 check "pid is preserved"           './enterfs.py -c '"$DEMO_CTR"' -- ./probe >/tmp/pp.out 2>&1 & p=$!; wait $p; [ "$(grep "^pid:" /tmp/pp.out | awk "{print \$2}")" = "$p" ]'
 
 hdr "rung 3 -- dynamically linked host binary"
-check "host node on debian"        "./enterfs.py -c $DEMO_CTR --host-prefix /mnt -- /usr/bin/node -e 'require(\"fs\").readdirSync(\"/cococlaw/needs/repo\")'"
-check "host node on alpine"        "./enterfs.py -c $DEMO_CTR_MUSL --host-prefix /mnt --host-bind /usr/share -- /usr/bin/node -e 'require(\"fs\").readdirSync(\"/cococlaw/needs/repo\")'"
+check "host node on debian"        "./enterfs.py -c $DEMO_CTR --host-prefix /mnt --host-bind /usr/share -- /usr/bin/node -e 'require(\"fs\").readdirSync(\"/work/repo\")'"
+check "host node on alpine"        "./enterfs.py -c $DEMO_CTR_MUSL --host-prefix /mnt --host-bind /usr/share -- /usr/bin/node -e 'require(\"fs\").readdirSync(\"/work/repo\")'"
 check "graft hidden from container" "test -z \"\$(podman exec $DEMO_CTR ls /mnt)\""
 
 hdr "options and failure modes"
@@ -44,7 +44,7 @@ check "--host-bind missing target"    "./enterfs.py -c $DEMO_CTR_MUSL --host-bin
 check "unknown container is clean"    "! ./enterfs.py -c no-such-container -- ./probe 2>&1 | grep -q Traceback"
 
 hdr "end to end"
-check "cococlaw-needs-explorer over stdio" "./03-mcp-demo.sh | grep -q 'server exited cleanly: True'"
+check "static MCP server over stdio"        "./03-mcp-demo.sh | grep -q 'server exited cleanly: True'"
 
 # ---------------------------------------------------------------- sidecars ---
 [ -x ./sidecar-enter ] || gcc -static -O2 -o sidecar-enter sidecar-enter.c
@@ -52,24 +52,27 @@ CPID=$(podman inspect --format '{{.State.Pid}}' "$DEMO_CTR")
 SC="docker.io/library/alpine:latest"
 BINDS="-v $PWD/sidecar-enter:/sidecar-enter:ro -v $PWD/probe:/probe:ro"
 SETNS_A="podman run --rm --pid=container:$DEMO_CTR --userns=container:$DEMO_CTR --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE $BINDS $SC /sidecar-enter --target 1 -- /probe"
-SETNS_B="podman run --rm --userns=container:$DEMO_CTR --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE -v /proc/$CPID/ns:/task-ns:ro $BINDS $SC /sidecar-enter --ns-file /task-ns/mnt -- /probe"
+SETNS_B="podman run --rm --userns=container:$DEMO_CTR --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE -v /proc/$CPID/ns:/target-ns:ro $BINDS $SC /sidecar-enter --ns-file /target-ns/mnt -- /probe"
 
 hdr "sidecar -- --volumes-from baseline"
-check "bind mounts propagate"        "podman run --rm --volumes-from $DEMO_CTR --userns=keep-id $SC ls /cococlaw/needs/repo | grep -q main.rs"
-check "does NOT get task rootfs"     "! podman run --rm --volumes-from $DEMO_CTR --userns=keep-id $SC test -e /usr/local/cargo/bin/cargo"
+check "bind mounts propagate"        "podman run --rm --volumes-from $DEMO_CTR --userns=keep-id $SC ls /work/repo | grep -q main.rs"
+check "does NOT get target rootfs"     "! podman run --rm --volumes-from $DEMO_CTR --userns=keep-id $SC test -e /usr/local/cargo/bin/cargo"
 
-hdr "sidecar -- joins the task mount namespace"
+hdr "sidecar -- joins the target mount namespace"
 check "A: via shared PID ns"         "$SETNS_A | grep -q 'ID=debian'"
-check "A: sees task toolchain"       "$SETNS_A | grep -q '/usr/local/cargo/bin/cargo *present'"
+check "A: sees target toolchain"       "$SETNS_A | grep -q '/usr/local/cargo/bin/cargo *present'"
 check "B: via bound ns dir, own PID ns" "$SETNS_B | grep -q 'ID=debian'"
-check "B: host root not visible"     "$SETNS_B | grep -q '/home/travis *ABSENT'"
+# $HOME is a useless marker here: the sidecar inherits its own image's HOME (/root),
+# which exists in the target image too. That the target's rootfs is what we see is
+# already asserted above via ID=debian; assert the target's volumes as well.
+check "B: sees the target's volumes"  "$SETNS_B | grep -q 'main.rs'"
 check "CAP_SYS_ADMIN is required"    "podman run --rm --pid=container:$DEMO_CTR --userns=container:$DEMO_CTR --cap-add=SYS_PTRACE $BINDS $SC /sidecar-enter --target 1 -- /probe 2>&1 | grep -q 'Operation not permitted'"
 check "CAP_SYS_PTRACE is required"   "podman run --rm --pid=container:$DEMO_CTR --userns=container:$DEMO_CTR --cap-add=SYS_ADMIN $BINDS $SC /sidecar-enter --target 1 -- /probe 2>&1 | grep -q 'Permission denied'"
-check "graft hidden from task ctr"   "test -z \"\$(podman exec $DEMO_CTR ls -A /mnt)\""
+check "graft hidden from target ctr"   "test -z \"\$(podman exec $DEMO_CTR ls -A /mnt)\""
 
 if podman image exists docker.io/mcp/filesystem:latest; then
     hdr "sidecar -- real third-party containerized MCP"
-    check "mcp/filesystem serves task files" "./22-sidecar-mcp-demo.sh | grep -q 'hello from the need repo'"
+    check "mcp/filesystem serves target files" "./22-sidecar-mcp-demo.sh | grep -q 'hello from the mounted project'"
 else
     note "skipping mcp/filesystem checks: image not pulled (run ./22-sidecar-mcp-demo.sh once)"
 fi

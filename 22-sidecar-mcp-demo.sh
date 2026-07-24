@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # Sidecar experiment 3 -- a REAL third-party containerized MCP server serving the
-# task container's filesystem.
+# target container's filesystem.
 #
-#   ./22-sidecar-mcp-demo.sh [task-container]
+#   ./22-sidecar-mcp-demo.sh [target-container]
 #
 # docker.io/mcp/filesystem is Docker's packaging of the reference filesystem MCP
 # server: Alpine/musl, `node /app/dist/index.js <allowed-dirs...>`. Nothing about
-# it is modified. The task container is Debian/glibc. The sidecar's rootfs supplies
-# node; the task container supplies the files.
+# it is modified. The target container is Debian/glibc. The sidecar's rootfs supplies
+# node; the target container supplies the files.
 #
 # Note the argument asymmetry, which is the whole idea made concrete:
 #   /mnt/app/dist/index.js   <- SIDECAR path, so it needs the graft prefix
-#   /cococlaw/needs/repo     <- TASK path, used bare
+#   /work/repo               <- TARGET path, used bare
 
 source "$(dirname "$0")/lib.sh"
 require_tools podman gcc
@@ -29,7 +29,7 @@ podman image inspect "$MCP_IMAGE" --format \
     '  entrypoint: {{json .Config.Entrypoint}}
   base:       {{index .Config.Env 1}}' 2>/dev/null
 printf '  base os:    '; podman run --rm --entrypoint sh "$MCP_IMAGE" -c 'grep -m1 ^ID= /etc/os-release'
-printf '  task ctr:   %s -> ' "$ctr"; podman exec "$ctr" grep -m1 ^ID= /etc/os-release
+printf '  target:      %s -> ' "$ctr"; podman exec "$ctr" grep -m1 ^ID= /etc/os-release
 
 hdr "driving the real server over stdio, against $ctr"
 exec python3 - "$ctr" "$cpid" "$MCP_IMAGE" "$PWD" <<'PY'
@@ -41,13 +41,13 @@ cmd = [
     "podman", "run", "--rm", "-i",
     f"--userns=container:{ctr}",
     "--cap-add=SYS_ADMIN", "--cap-add=SYS_PTRACE",
-    "-v", f"/proc/{cpid}/ns:/task-ns:ro",
+    "-v", f"/proc/{cpid}/ns:/target-ns:ro",
     "-v", f"{here}/sidecar-enter:/sidecar-enter:ro",
     "--entrypoint", "/sidecar-enter",
     image,
-    "--ns-file", "/task-ns/mnt", "--graft", "/mnt", "--cwd", "/",
+    "--ns-file", "/target-ns/mnt", "--graft", "/mnt", "--cwd", "/",
     "--",
-    "/usr/local/bin/node", "/mnt/app/dist/index.js", "/cococlaw/needs/repo",
+    "/usr/local/bin/node", "/mnt/app/dist/index.js", "/work/repo",
 ]
 srv = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                        text=True, bufsize=1)
@@ -98,13 +98,13 @@ if allowed:
 
 lister = pick("list_directory", "directory_tree")
 if lister:
-    print(f"{lister}(/cococlaw/needs/repo):\n" + text(call("tools/call",
-          {"name": lister, "arguments": {"path": "/cococlaw/needs/repo"}})) + "\n")
+    print(f"{lister}(/work/repo):\n" + text(call("tools/call",
+          {"name": lister, "arguments": {"path": "/work/repo"}})) + "\n")
 
 reader = pick("read_text_file", "read_file")
 if reader:
-    print(f"{reader}(/cococlaw/needs/repo/main.rs):\n" + text(call("tools/call",
-          {"name": reader, "arguments": {"path": "/cococlaw/needs/repo/main.rs"}})) + "\n")
+    print(f"{reader}(/work/repo/main.rs):\n" + text(call("tools/call",
+          {"name": reader, "arguments": {"path": "/work/repo/main.rs"}})) + "\n")
 
 srv.stdin.close()
 srv.wait(timeout=15)

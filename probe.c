@@ -3,8 +3,8 @@
  * Built static (`gcc -static -o probe probe.c`) so it can be exec'd via
  * execveat() after setns() with nothing bind-mounted into the container: a
  * static binary has no ELF interpreter and no shared libraries to resolve, so
- * the container's libc is never consulted. That is the whole point of rung 2 --
- * it is exactly the glibc coupling that bites cococlaw-needs-explorer today.
+ * the container's libc is never consulted. That is the whole point of rung 2,
+ * and it is what lets one binary work against both a glibc and a musl image.
  *
  * Deliberately avoids getpwuid()/getgrgid(): those pull in NSS, which does not
  * work in a static binary.
@@ -74,6 +74,12 @@ static void probe_path(const char *path) {
     printf("%-38s %s\n", path, stat(path, &st) == 0 ? "present" : "ABSENT");
 }
 
+static void probe_labeled(const char *label, const char *path) {
+    struct stat st;
+    printf("%-38s %s\n", label,
+           (path && stat(path, &st) == 0) ? "present" : "ABSENT");
+}
+
 int main(int argc, char **argv) {
     printf("=== probe: static host binary, container filesystem view ===\n");
     printf("argv[0]:       %s\n", argc > 0 ? argv[0] : "(none)");
@@ -85,13 +91,14 @@ int main(int argc, char **argv) {
     show_osrelease();
     printf("\n");
     list_dir("/", 40);
-    list_dir("/cococlaw/needs/repo", 40);
+    list_dir("/work/repo", 40);
     printf("\n");
     /* Toolchain from the *image*, which a host process cannot otherwise see. */
     probe_path("/usr/local/cargo/bin/cargo");
     probe_path("/usr/local/rustup");
-    /* Present on the host, absent in the image -- proves we are not on host /. */
-    probe_path("/home/travis");
+    /* Exists on the host and not in a stock image, so its absence proves we are
+     * looking at the container's root rather than the host's. */
+    probe_labeled("host $HOME", getenv("HOME"));
 
     /* `probe --hold N` stays alive holding the container's mount namespace open,
      * so teardown behaviour can be observed. */
