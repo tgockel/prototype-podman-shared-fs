@@ -10,8 +10,10 @@ and naming it as a toolset command (`cococlaw-agent.rs:1393-1477`) -- which coup
 host-built binary to the image's libc (`doc/agent/harness/toolsets.md`,
 `plan/next/needs-explorer-musl-build.md`).
 
-This prototype removes both problems: the server is an ordinary host process, and the
-image needs no cooperation at all.
+This prototype removes both problems, two ways. The MCP server runs either as an ordinary
+**host process** or as a **sidecar container** — and in both cases the user's task image
+needs no cooperation at all. The sidecar form matters because most MCP servers ship as
+container images: it runs one unmodified, straight from a registry.
 
 ## It works. Results on this machine
 
@@ -28,6 +30,9 @@ Podman 4.9.3 rootless, runc, kernel 7.0.0-28, Python 3.12.3.
 | 7 | `podman rm -f` with a live launched process | exit 0, container gone, **process survives** (see Gotchas) |
 | 8 | Mount/process leaks after teardown | none |
 | 9 | **CocoClaw's real `cococlaw-needs-explorer` over stdio** | full MCP handshake, `list_files`/`read_file` served from the container, no bind mount, no `podman exec` |
+| 10 | Sidecar via `--volumes-from` | bind mounts **do** propagate; repo at the identical path, task rootfs not included |
+| 11 | Sidecar joins the task's mount namespace | Alpine sidecar sees the Debian task rootfs, its toolchain and its volumes |
+| 12 | **Unmodified `docker.io/mcp/filesystem` as a sidecar** | Alpine/musl node 22 serving a Debian/glibc task container's repo over stdio |
 
 Check #9 is the whole point, so in full:
 
@@ -119,6 +124,94 @@ loader with an explicit `--library-path`.
     --host-bind /usr/share -- /usr/bin/node -e 'console.log(1)'
 ```
 
+## Sidecars: when the MCP ships as a container image
+
+Most MCP servers are distributed as images, not host binaries. Running them on the host
+just relocates the "users must install things" burden. A **sidecar** fixes that: run the
+MCP server in its own container, from its own image, but give it the *task* container's
+filesystem view. The MCP image supplies the runtime; the task container supplies the files.
+
+Podman shares every namespace **except the one we need**:
+
+| flag | shares |
+|---|---|
+| `--pid=container:id`, `--userns=container:id`, `--network=`, `--ipc=`, `--uts=`, `--cgroupns=` | those namespaces |
+| `--volumes-from CONTAINER[:ro]` | the source container's mounts |
+| — | **no mount-namespace flag exists** |
+
+So there are two routes, and the cheap one may be enough.
+
+### `--volumes-from` -- baseline, no privileges
+
+```sh
+podman run --rm --volumes-from podman-shared-fs-demo --userns=keep-id alpine ...
+```
+
+**Bind mounts do propagate** (podman's man page only promises "volumes"; CocoClaw's needs are
+binds). The sidecar sees `/cococlaw/needs/repo` at the identical path, with correct uid 1000.
+
+What it does *not* get: the task image's rootfs. No `cargo`, no toolchain, its own
+`/etc/os-release`. And the mount is re-bound from the **host** source, so it is the host's
+view of that directory, not the task container's -- nested mounts inside the repo would not
+appear. For a filesystem MCP that only needs the repo, this is likely sufficient.
+
+### `setns` from inside the sidecar -- full fidelity
+
+`sidecar-enter.c` is the same technique as `enterfs.py`, relocated: the sidecar's own rootfs
+plays exactly the role the host root played in rung 3.
+
+```sh
+podman run --rm -i \
+  --userns=container:<task> \
+  --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE \
+  -v /proc/<task-pid>/ns:/task-ns:ro \
+  -v $PWD/sidecar-enter:/sidecar-enter:ro \
+  --entrypoint /sidecar-enter \
+  docker.io/mcp/filesystem:latest \
+  --ns-file /task-ns/mnt --graft /mnt -- \
+  /usr/local/bin/node /mnt/app/dist/index.js /cococlaw/needs/repo
+```
+
+Each requirement was pinned down by a negative test, not assumed:
+
+| requirement | needed? | why |
+|---|---|---|
+| `--userns=container:<task>` | **yes** | must be in the user namespace that *owns* the target mount namespace |
+| `--cap-add=SYS_ADMIN` | **yes** | without it `setns(CLONE_NEWNS)` returns EPERM; the default seccomp profile gates `setns` on this capability |
+| `--cap-add=SYS_PTRACE` | **yes** | opening *any* nsfs file needs ptrace-mode read of its owning process |
+| `--pid=container:<task>` | **optional** | convenience (target becomes PID 1). Binding `/proc/<pid>/ns` instead keeps the sidecar's own PID namespace |
+
+Verified with `docker.io/mcp/filesystem` — Docker's packaging of the reference filesystem
+server, **completely unmodified**: Alpine/musl, `node /app/dist/index.js`. Against a
+**Debian/glibc** task container it serves `list_directory` and `read_file` over stdio from
+`/cococlaw/needs/repo`. A musl binary running on a glibc rootfs, fully decoupled — the same
+property that makes the static rung work, arrived at from the other direction.
+
+**The argument asymmetry is the idea made concrete.** In that command line:
+
+```
+/mnt/app/dist/index.js    <- SIDECAR path, needs the graft prefix
+/cococlaw/needs/repo      <- TASK path, used bare
+```
+
+Arguments naming the MCP's own files must be prefixed; arguments naming the work must not.
+`sidecar-enter` rewrites the *program* path only — it cannot know which of your arguments is
+which, and guessing would be worse than making you say it.
+
+### Sidecar vs. host process
+
+|  | host process | sidecar |
+|---|---|---|
+| MCP distribution | must be installed on the host | **any container image, unmodified** |
+| task image | untouched | untouched |
+| sandboxing | none — host network, host capabilities | still a container: cgroups, network policy, seccomp apply |
+| privileges | none beyond the user's own | **CAP_SYS_ADMIN + CAP_SYS_PTRACE** in the rootless userns |
+| supervision | direct child, pid preserved | `podman run` is the child, as today |
+
+Neither dominates. The sidecar's capabilities are scoped to the rootless user namespace, not
+host root, so they are far weaker than they read — but they are still the price for what the
+host process gets for free.
+
 ## Gotchas found the hard way
 
 - **`nsenter -w` resolves the directory on the *caller's* side.** `--wd=/workspace` fails
@@ -170,10 +263,14 @@ thing the container is providing.
 | `01-enter.sh` | rung 1, `nsenter`, container-resident programs |
 | `enterfs.py` | rungs 2 and 3, the actual launcher |
 | `03-mcp-demo.sh` | end-to-end MCP server, host-side, container view |
-| `test.sh` | the 15 checks behind the results table |
+| `sidecar-enter.c` | static in-sidecar launcher (the same technique, relocated) |
+| `20-sidecar-volumes.sh` | sidecar baseline: `--volumes-from` |
+| `21-sidecar-setns.sh` | sidecar full fidelity, both variants + negative tests |
+| `22-sidecar-mcp-demo.sh` | real `docker.io/mcp/filesystem`, unmodified |
+| `test.sh` | the 25 checks behind the results tables |
 
 ```sh
-./demo-up.sh && ./test.sh          # 15 passed, 0 failed
+./demo-up.sh && ./test.sh          # 25 passed, 0 failed
 ./demo-down.sh
 ```
 
@@ -189,3 +286,10 @@ thing the container is providing.
 - A Rust port should do the two `setns` calls itself rather than shelling out, and must do so
   before starting the tokio runtime (single-threaded requirement above). The usual shape is a
   `fork()` + setns in the child, or `Command::pre_exec`.
+
+The sidecar form suggests a second, larger change: a harness could name an **MCP image**
+rather than a command that must already exist in the task image. `ToolsetSpec::Mcp` gains an
+`image` field; the runner starts the sidecar with `--userns=container:<task>`, the two
+capabilities, and the ns bind, and keeps the stdio pipe exactly as `mcp.rs:134-148` does now.
+That turns "install these MCP servers into your image" into "name the image you want", which
+is the whole problem this prototype set out to remove.

@@ -46,5 +46,33 @@ check "unknown container is clean"    "! ./enterfs.py -c no-such-container -- ./
 hdr "end to end"
 check "cococlaw-needs-explorer over stdio" "./03-mcp-demo.sh | grep -q 'server exited cleanly: True'"
 
+# ---------------------------------------------------------------- sidecars ---
+[ -x ./sidecar-enter ] || gcc -static -O2 -o sidecar-enter sidecar-enter.c
+CPID=$(podman inspect --format '{{.State.Pid}}' "$DEMO_CTR")
+SC="docker.io/library/alpine:latest"
+BINDS="-v $PWD/sidecar-enter:/sidecar-enter:ro -v $PWD/probe:/probe:ro"
+SETNS_A="podman run --rm --pid=container:$DEMO_CTR --userns=container:$DEMO_CTR --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE $BINDS $SC /sidecar-enter --target 1 -- /probe"
+SETNS_B="podman run --rm --userns=container:$DEMO_CTR --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE -v /proc/$CPID/ns:/task-ns:ro $BINDS $SC /sidecar-enter --ns-file /task-ns/mnt -- /probe"
+
+hdr "sidecar -- --volumes-from baseline"
+check "bind mounts propagate"        "podman run --rm --volumes-from $DEMO_CTR --userns=keep-id $SC ls /cococlaw/needs/repo | grep -q main.rs"
+check "does NOT get task rootfs"     "! podman run --rm --volumes-from $DEMO_CTR --userns=keep-id $SC test -e /usr/local/cargo/bin/cargo"
+
+hdr "sidecar -- joins the task mount namespace"
+check "A: via shared PID ns"         "$SETNS_A | grep -q 'ID=debian'"
+check "A: sees task toolchain"       "$SETNS_A | grep -q '/usr/local/cargo/bin/cargo *present'"
+check "B: via bound ns dir, own PID ns" "$SETNS_B | grep -q 'ID=debian'"
+check "B: host root not visible"     "$SETNS_B | grep -q '/home/travis *ABSENT'"
+check "CAP_SYS_ADMIN is required"    "podman run --rm --pid=container:$DEMO_CTR --userns=container:$DEMO_CTR --cap-add=SYS_PTRACE $BINDS $SC /sidecar-enter --target 1 -- /probe 2>&1 | grep -q 'Operation not permitted'"
+check "CAP_SYS_PTRACE is required"   "podman run --rm --pid=container:$DEMO_CTR --userns=container:$DEMO_CTR --cap-add=SYS_ADMIN $BINDS $SC /sidecar-enter --target 1 -- /probe 2>&1 | grep -q 'Permission denied'"
+check "graft hidden from task ctr"   "test -z \"\$(podman exec $DEMO_CTR ls -A /mnt)\""
+
+if podman image exists docker.io/mcp/filesystem:latest; then
+    hdr "sidecar -- real third-party containerized MCP"
+    check "mcp/filesystem serves task files" "./22-sidecar-mcp-demo.sh | grep -q 'hello from the need repo'"
+else
+    note "skipping mcp/filesystem checks: image not pulled (run ./22-sidecar-mcp-demo.sh once)"
+fi
+
 printf '\n\033[1mpassed=%d failed=%d\033[0m\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
